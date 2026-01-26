@@ -1,0 +1,9 @@
+fastapi
+ray
+ray[serve]
+numpy==2.1.0
+torch==2.6.0
+transformers
+grpcio
+grpcio-tools
+protobuf
