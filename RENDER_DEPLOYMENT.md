@@ -25,8 +25,7 @@ git commit -m "Initial commit for Render deployment"
 
 # Tạo repo mới trên GitHub, sau đó:
 git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git branch -M main
-git push -u origin main
+git push -u origin master
 ```
 
 ---
@@ -59,7 +58,7 @@ git push -u origin main
 3. Cấu hình:
    - **Name**: `teledeaf-api`
    - **Region**: Singapore (hoặc Oregon)
-   - **Branch**: `main`
+   - **Branch**: `master`
    - **Runtime**: Docker
    - **Docker Command**: `python -m app.api.api_main`
    - **Plan**: Free
@@ -71,7 +70,7 @@ git push -u origin main
 3. Cấu hình:
    - **Name**: `teledeaf-grpc`
    - **Region**: Singapore
-   - **Branch**: `main`
+   - **Branch**: `master`
    - **Runtime**: Docker
    - **Docker Command**: `python -m grpc_service.server.main`
    - **Plan**: Free
@@ -122,7 +121,7 @@ Render tự động deploy khi bạn push code:
 # Commit và push
 git add .
 git commit -m "Update feature X"
-git push origin main
+git push origin master
 
 # Render tự động build và deploy! ✨
 ```

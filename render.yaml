@@ -3,6 +3,7 @@ services:
   - type: web
     name: teledeaf-api
     env: docker
+    branch: master
     dockerfilePath: ./Dockerfile
     dockerCommand: python -m app.api.api_main
     plan: free
@@ -21,6 +22,7 @@ services:
   - type: worker
     name: teledeaf-grpc
     env: docker
+    branch: master
     dockerfilePath: ./Dockerfile
     dockerCommand: python -m grpc_service.server.main
     plan: free
