@@ -18,8 +18,11 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 # Copy application code
 COPY . .
 
+# Make start script executable
+RUN chmod +x start.sh
+
 # Expose ports
 EXPOSE 50051 8000
 
-# Default: Run gRPC server
-CMD ["python", "-m", "grpc_service.server.main"]
+# Default: Run FastAPI server (Render sẽ override)
+CMD ["python", "-m", "app.api.api_main"]

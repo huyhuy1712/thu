@@ -1,0 +1,30 @@
+services:
+  # FastAPI Service (Main API)
+  - type: web
+    name: teledeaf-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m app.api.api_main
+    plan: free
+    region: singapore  # Hoặc oregon cho US
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: GRPC_HOST
+        value: localhost
+      - key: GRPC_PORT
+        value: 50051
+    healthCheckPath: /
+    autoDeploy: true
+    
+  # gRPC Service (Background Worker)
+  - type: worker
+    name: teledeaf-grpc
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m grpc_service.server.main
+    plan: free
+    region: singapore
+    envVars:
+      - key: GRPC_PORT
+        value: 50051
