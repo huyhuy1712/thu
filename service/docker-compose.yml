@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # gRPC Server (Internal Service)
+  grpc-server:
+    build: .
+    container_name: teledeaf-grpc
+    ports:
+      - "50051:50051"
+    environment:
+      - GRPC_PORT=50051
+    command: python -m grpc_service.server.main
+    networks:
+      - teledeaf-network
+    restart: unless-stopped
+
+  # FastAPI REST Gateway
+  fastapi-server:
+    build: .
+    container_name: teledeaf-fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      - GRPC_HOST=grpc-server
+      - GRPC_PORT=50051
+    command: python -m app.api.api_main
+    depends_on:
+      - grpc-server
+    networks:
+      - teledeaf-network
+    restart: unless-stopped
+
+networks:
+  teledeaf-network:
+    driver: bridge
