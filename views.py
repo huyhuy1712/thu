@@ -16,11 +16,11 @@ from .serializers import *
 from .models import UserInfo, User, FriendRequest
 from rest_framework.exceptions import AuthenticationFailed
 from .messages import ErrorMessages, SuccessMessages
+from .services.model_services import *
+from .services.json_compare_service import test_manual_file_similarity
 from .services.text_to_sign_service import text_to_sign_process_smoothing
 from src.utils.util import convert_none_to_nan
-from .services.grpc_ai_client import recognize_sign_grpc, health_check_grpc
 from .services.llm_services import LLMService
-from .services.video_processing_service import VideoProcessingService
 from api.const import *
 from .exceptions import handle_validation_error
 from django.db.models import Q
@@ -34,8 +34,10 @@ from api.services.vn_chunker_service import chunk_text_strings
 from django.http import JsonResponse, HttpResponse, HttpResponseBadRequest
 import os, json, uuid, tempfile
 from django.core.cache import cache
-from .models import Lesson, Section, UserLessons, UserSections
+from .models import *
 from django.db.models import Sum
+
+
 from api.services.user_lesson_service import mark_word_completed
 
 googleGenAIService = GoogleGenAIService()
@@ -44,24 +46,6 @@ googleGenAIService = GoogleGenAIService()
 @permission_classes([AllowAny])
 def ping(request):
     return Response({"message": SuccessMessages.SERVER_AVAILABLE}, status=200)
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def health_check_ai(request):
-    """Check AI service connectivity"""
-    is_healthy, message = health_check_grpc(timeout=5)
-    if is_healthy:
-        return Response({
-            "status": "healthy",
-            "service": "AI gRPC Service",
-            "message": message
-        }, status=200)
-    else:
-        return Response({
-            "status": "unhealthy",
-            "service": "AI gRPC Service",
-            "error": message
-        }, status=503)
 
 # region User Feature
 @api_view(['GET'])
@@ -182,91 +166,33 @@ def llm_invoke(request):
         }
         return Response(error_details, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-def adapt_frames_to_xyz(frames):
-    """Normalize various frame formats to [{"x": [...], "y": [...], "z": [...]}]."""
-    adapted = []
-    for f in frames:
-        if not f:
-            continue
-
-        # Case 1: already has x/y/z arrays
-        if isinstance(f, dict) and all(k in f for k in ("x", "y", "z")):
-            adapted.append({
-                "x": f.get("x", []),
-                "y": f.get("y", []),
-                "z": f.get("z", []),
-            })
-            continue
-
-        # Case 2: has keypoints: [[x,y,z], ...]
-        if isinstance(f, dict):
-            kps = f.get("keypoints")
-            if kps:
-                xs = [pt[0] for pt in kps]
-                ys = [pt[1] for pt in kps]
-                zs = [pt[2] for pt in kps]
-                adapted.append({"x": xs, "y": ys, "z": zs})
-                continue
-
-        # Case 3: list of triplets [[x,y,z], ...]
-        if isinstance(f, list) and f and isinstance(f[0], (list, tuple)):
-            xs = [pt[0] for pt in f]
-            ys = [pt[1] for pt in f]
-            zs = [pt[2] for pt in f]
-            adapted.append({"x": xs, "y": ys, "z": zs})
-            continue
-
-        # Case 4: flat list of numbers interpreted as a single frame [x1, y1, z1, x2, y2, z2, ...]
-        if isinstance(f, list) and f and all(isinstance(v, (int, float)) for v in f):
-            if len(f) % 3 == 0:
-                xs = f[0::3]
-                ys = f[1::3]
-                zs = f[2::3]
-                adapted.append({"x": xs, "y": ys, "z": zs})
-                continue
-
-    return adapted
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def sign_to_text(request):
-    platform = request.GET.get('platform', PLATFORM_MOBILE)
-    language_code = request.GET.get('language_code', LANGUAGE_AU)
-
-    payload = request.data or {}
-    frames = payload.get("frames") or payload.get("data") or []
-
-    # Support landmarks_data_list: array of frames, each frame is list of [x,y,z]
-    if not frames and "landmarks_data_list" in payload:
-        frames = payload.get("landmarks_data_list", [])
-
-    # If caller sends a single flat list (one frame): [x1, y1, z1, x2, y2, z2, ...]
-    if isinstance(frames, list) and frames and all(isinstance(v, (int, float)) for v in frames):
-        frames = [frames]
-
-    adapted = adapt_frames_to_xyz(frames)
-
     try:
-        validated_data = RequestModel(data=adapted)
+        platform = request.GET.get('platform', PLATFORM_MOBILE) 
+        language_code = request.GET.get('language_code', LANGUAGE_AU)
+
+        crawl_data = request.data
+        crawl_data["data"] = convert_none_to_nan(crawl_data.get("data"))
+        print(platform + language_code)
+        try:
+            data = RequestModel(data=crawl_data["data"])
+        except ValidationError as e:
+            return Response({"error": e.errors()}, status=status.HTTP_400_BAD_REQUEST)
+        
+        data, status_code = process_prediction_v3(data.data, platform, language_code)
+
+        if platform == PLATFORM_MOBILE:
+            return Response(data, status=status_code)
+        else:
+            return standard_response(
+                status=status_code,
+                data=data,
+            )
+
     except ValidationError as e:
         return Response({"error": e.errors()}, status=status.HTTP_400_BAD_REQUEST)
-
-    predicted_class, confidence, error, status_code = recognize_sign_grpc(
-        validated_data.data,
-        platform=platform,
-        language_code=language_code,
-    )
-
-    response_data = {"Class": predicted_class, "Confidence": confidence}
-    if error:
-        response_data["error"] = error
-
-    if platform == PLATFORM_MOBILE:
-        return Response(response_data, status=status_code)
-    return standard_response(
-        status=status_code,
-        data=[response_data] if status_code == 200 else response_data,
-    )
     
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -276,47 +202,15 @@ def sign_to_text_combine(request):
         language_code = request.GET.get('language_code', LANGUAGE_AU)  
 
         json_data = json.loads(request.body)
-        
-        # Parse JSON data similar to original process_prediction_combine_api
-        from .services.json_compare_service import rearrange_landmark_data_concatenated_padded
-        json_data_processed = rearrange_landmark_data_concatenated_padded(json_data)
-        json_data_processed["data"] = convert_none_to_nan(json_data_processed.get("data"))
-        
-        try:
-            validated_data = RequestModel(data=json_data_processed["data"])
-        except ValidationError as e:
-            return standard_response(
-                status=status.HTTP_400_BAD_REQUEST,
-                message=str(e.errors())
-            )
-        
-        # Call gRPC AI service
-        predicted_class, confidence, error, status_code = recognize_sign_grpc(
-            validated_data.data,
-            platform=platform or PLATFORM_MOBILE,
-            language_code=language_code or LANGUAGE_AU
-        )
-        
-        response_data = [{
-            "Class": predicted_class,
-            "Confidence": confidence
-        }] if status_code == 200 else {"error": error}
+        data, status_code = process_prediction_combine_api(json_data, platform, language_code)
 
         return standard_response(
             status=status_code,
-            data=response_data,
+            data=data,
         )
 
     except ValidationError as e:
-        return standard_response(
-            status=status.HTTP_400_BAD_REQUEST,
-            message=str(e.errors())
-        )
-    except Exception as e:
-        return standard_response(
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            message=f"Error connecting to AI service: {str(e)}"
-        )    
+        return Response({"error": e.errors()}, status=status.HTTP_400_BAD_REQUEST)    
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -374,77 +268,6 @@ def json_to_text(request):
 
     except ValidationError as e:
         return Response({"error": e.errors()}, status=status.HTTP_400_BAD_REQUEST)    
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def recognize_sign_from_minio_video(request):
-    """
-    Lấy video từ MinIO, extract frames, extract landmarks, gửi tới AI gRPC.
-    
-    Request body:
-    {
-        "minio_path": "videos/my_sign.mp4",
-        "platform": "web",  (optional, default "web")
-        "language_code": "au",  (optional, default "au")
-        "sample_rate": 5  (optional, lấy 1 frame cứ mỗi N frame)
-    }
-    """
-    try:
-        data = request.data
-        minio_path = data.get("minio_path")
-        platform = data.get("platform", "web")
-        language_code = data.get("language_code", "au")
-        sample_rate = int(data.get("sample_rate", 5))
-        
-        if not minio_path:
-            return standard_response(
-                status=status.HTTP_400_BAD_REQUEST,
-                message="minio_path is required"
-            )
-        
-        # Import MediaPipe detector
-        try:
-            import mediapipe as mp
-            mp_holistic = mp.solutions.holistic
-            detector = mp_holistic.Holistic()
-        except ImportError:
-            return standard_response(
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                message="MediaPipe not installed"
-            )
-        
-        # Process video
-        video_service = VideoProcessingService()
-        predicted_class, confidence, error, response_status = (
-            video_service.process_video_from_minio_and_recognize(
-                minio_path=minio_path,
-                detector=detector,
-                platform=platform,
-                language_code=language_code,
-                sample_rate=sample_rate
-            )
-        )
-        
-        if response_status != 200:
-            return standard_response(
-                status=response_status,
-                message=error or "Error processing video"
-            )
-        
-        return standard_response(
-            status=status.HTTP_200_OK,
-            data={
-                "Class": predicted_class,
-                "Confidence": confidence
-            }
-        )
-    
-    except Exception as e:
-        return standard_response(
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            message=str(e)
-        )
-
 # endregion
 
 # region Authen Feature
@@ -1518,21 +1341,14 @@ def get_learning_status(request):
 # endregion
 
 # region search and filter lessons for user
-# @api_view(["GET"])
-# @permission_classes([AllowAny])
-# def lessons_search_view(request):
-#     # user = request.user
-#     user = User.objects.get(id=16)
-#     query_params = request.query_params  
-#     print("Query Params:", query_params)
-#     lessons_list = search_lessons_for_user(query_params, user)
-#     print("Lessons List:", lessons_list)
-#     serializer = LessonListItemSerializer(lessons_list, many=True)
-#     return Response(serializer.data)
-
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def lessons_search_view(request):
+    language_code = request.GET.get('language_code', LANGUAGE_AU)
+
+    if not language_code:
+        return Response({"detail": "Missing 'language' query parameter"}, status=status.HTTP_400_BAD_REQUEST)
+ 
     user = request.user
     query_params = request.query_params  
 
@@ -1586,7 +1402,7 @@ def get_user_notebook(request):
 
                 sections_data.append({
                     "id": s.id,
-                    "content": s.sign or s.content or "",
+                    "content": s.content or s.sign or "",
                     "description": s.content or "",
                     "tip": s.tips or "",
                     "is_user_noted": bool(us.is_user_noted),
@@ -1681,3 +1497,385 @@ def manage_user_notebook(request):
     except Exception as e:
         return standard_response(status=status.HTTP_500_INTERNAL_SERVER_ERROR, message=str(e))
 # endregion
+
+# region Contact Feature
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def create_contact(request):
+    """
+    Create a new contact message
+    """
+    try:
+        serializer = ContactSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return standard_response(
+                status=status.HTTP_201_CREATED,
+                message=SuccessMessages.CREATED_SUCCESSFULLY,
+                data=serializer.data
+            )
+        else:
+            return standard_response(
+                status=status.HTTP_400_BAD_REQUEST,
+                message="Validation error",
+                data=serializer.errors
+            )
+    except Exception as e:
+        return standard_response(
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=str(e)
+        )
+# endregion
+
+# region Advanced_Elearning Feature
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_conversation_lessons(request):
+    """
+    Fetch questions and progress data. 
+    Matches your Model where the field is 'conversation_keyword'.
+    """
+    try:
+        lesson_id = request.query_params.get('lesson_id')
+        if lesson_id is None and request.body:
+            try:
+                payload = json.loads(request.body.decode('utf-8'))
+                lesson_id = payload.get('lesson_id')
+            except Exception:
+                lesson_id = None
+
+        if lesson_id is None:
+            return Response({"message": "Missing lesson_id"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+
+        # Fetch questions for the lesson
+        questions = ConversationElearning.objects.filter(
+            lesson_id=lesson_id,
+            type=ConversationElearning.MessageType.QUESTION
+        ).select_related('answer').order_by('order_index', 'id')
+
+        response_items = []
+
+        for item in questions:
+            # Check progress in User_Conversations
+            user_conv = UserConversation.objects.filter(
+                user=user, 
+                conversation=item
+            ).first()
+
+            has_do = None
+            if user_conv:
+                # IMPORTANT: Matches your model field name 'conversation_keyword'
+                user_keyword_results = UserConversationKeyword.objects.filter(
+                    user=user,
+                    conversation=item
+                ).select_related('conversation_keyword') 
+                
+                keyword_details = []
+                score = 0
+                
+                for uk in user_keyword_results:
+                    if uk.status == 'success':
+                        score += 1
+                    
+                    # Accessing keyword_text via 'conversation_keyword' relation
+                    keyword_details.append({
+                        "conversation_keyword_id": uk.conversation_keyword_id,
+                        "keyword_text": uk.conversation_keyword.keyword_text if uk.conversation_keyword else None,
+                        "status": uk.status
+                    })
+
+                has_do = {
+                    "total_score": len(keyword_details),
+                    "score": score,
+                    "status": user_conv.status,
+                    "progress": float(user_conv.progress),
+                    "keywords": keyword_details
+                }
+
+            response_items.append({
+                "id": item.id,
+                "message": item.message,
+                "order_index": item.order_index,
+                "answer": item.answer.message if item.answer else None,
+                "has_do": has_do
+            })
+
+        return Response({"Questions": response_items}, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({"message": f"Server Error: {str(e)}"}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_user_conversation(request):
+    """
+    Updates UserConversation progress and triggers an update for the overall UserLessons progress.
+    Ensures that lesson progress is relative to the total number of questions in the lesson.
+    """
+    try:
+        conv_id = request.data.get('conversation_id')
+        user_keywords = request.data.get('keywords', [])
+
+        # 1. Validation
+        if not conv_id:
+            return Response({"message": "conversation_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get current conversation to find the associated lesson_id
+        conversation = ConversationElearning.objects.filter(id=conv_id).first()
+        if not conversation:
+            return Response({"message": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        lesson_id = conversation.lesson_id
+
+        # 2. Database Keywords Mapping
+        # Fetch static keywords for comparison
+        db_keywords = ConversationKeyword.objects.filter(conversation_id=conv_id).values('id', 'keyword_text', 'position')
+        total_keywords_count = db_keywords.count()
+        db_keyword_map = {(kw['keyword_text'], kw['position']): kw['id'] for kw in db_keywords}
+
+        if total_keywords_count == 0:
+            return Response({"message": "This conversation has no keywords defined"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. Use transaction to ensure data integrity across multiple tables
+        with transaction.atomic():
+            now = timezone.now()
+            
+            # --- Part A: Handle UserConversationKeyword ---
+            # Delete old practice records for this user/conversation to refresh data
+            UserConversationKeyword.objects.filter(user=request.user, conversation_id=conv_id).delete()
+            
+            to_create_keywords = []
+            correct_keyword_ids = set()
+            saved_keywords_res = []
+
+            # Map user input to database keywords
+            for user_kw in user_keywords:
+                kw_id = db_keyword_map.get((user_kw.get('word'), user_kw.get('position')))
+                if kw_id and kw_id not in correct_keyword_ids:
+                    to_create_keywords.append(UserConversationKeyword(
+                        user=request.user, 
+                        conversation_id=conv_id,
+                        conversation_keyword_id=kw_id, # Matches model field name
+                        status='success', 
+                        last_practiced_at=now
+                    ))
+                    correct_keyword_ids.add(kw_id)
+
+            # Identify keywords that were missed or incorrect
+            all_keyword_ids = set(kw['id'] for kw in db_keywords)
+            failed_ids = all_keyword_ids - correct_keyword_ids
+
+            for f_id in failed_ids:
+                to_create_keywords.append(UserConversationKeyword(
+                    user=request.user, 
+                    conversation_id=conv_id,
+                    conversation_keyword_id=f_id, 
+                    status='failed', 
+                    last_practiced_at=now
+                ))
+
+            # Bulk save for better performance
+            UserConversationKeyword.objects.bulk_create(to_create_keywords)
+            
+            # Prepare keyword data for the final response
+            for obj in to_create_keywords:
+                saved_keywords_res.append({
+                    "keyword_id": obj.conversation_keyword_id, 
+                    "status": obj.status
+                })
+
+            # --- Part B: Handle UserConversation (Individual question progress) ---
+            # Calculate individual progress based on keyword success rate
+            progress_value = round(len(correct_keyword_ids) / total_keywords_count, 2)
+            # Threshold for success is 75%
+            conv_status = "success" if progress_value >= 0.75 else "failed"
+
+            user_conv, _ = UserConversation.objects.update_or_create(
+                user=request.user,
+                conversation_id=conv_id,
+                defaults={'progress': progress_value, 'status': conv_status, 'updated_at': now}
+            )
+
+            # --- Part C: Update Overall Lesson Progress in UserLessons ---
+            
+            # Get all question IDs belonging to this lesson to use as the fixed denominator
+            all_lesson_questions = ConversationElearning.objects.filter(
+                lesson_id=lesson_id, 
+                type=ConversationElearning.MessageType.QUESTION
+            )
+            all_conv_ids = all_lesson_questions.values_list('id', flat=True)
+            total_questions_in_lesson = all_conv_ids.count()
+
+            if total_questions_in_lesson > 0:
+                # Calculate the total progress sum accumulated by the user for this lesson
+                stats = UserConversation.objects.filter(
+                    user=request.user,
+                    conversation_id__in=all_conv_ids
+                ).aggregate(total_sum=Sum('progress'))
+                
+                total_sum = stats['total_sum'] or 0.0
+                
+                # Overall progress = (Sum of individual progress) / (Total questions in lesson)
+                # This ensures 100% is only reached when all questions are completed
+                overall_progress = float(total_sum) / total_questions_in_lesson
+            else:
+                overall_progress = 0.0
+
+            # Update UserLessons record
+            user_lesson, _ = UserLessons.objects.update_or_create(
+                user=request.user,
+                lesson_id=lesson_id,
+                defaults={
+                    'progress': round(overall_progress, 2),
+                    'status': 'completed' if overall_progress >= 0.95 else 'inprogress', 
+                    'update_by': request.user,
+                    'updated_date': now
+                }
+            )
+
+            # 4. Final Response Construction
+            data_res = {
+                "saved_conversations": {
+                    "conversation_id": int(conv_id),
+                    "progress": float(user_conv.progress),
+                    "lesson_overall_progress": float(round(overall_progress, 2)),
+                    "status": user_conv.status,
+                    "updated_at": user_conv.updated_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    "saved_keywords": saved_keywords_res
+                }
+            }
+
+            return Response({
+                "status": 200,
+                "message": "User Conversation and Lesson progress updated successfully",
+                "data": data_res
+            }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response(
+            {"message": f"Server Error: {str(e)}"}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_user_conversation(request):
+    """
+    Handles deletion of user conversation data.
+    - Path 1: .../delete_user_conversation (Delete all records for a lesson)
+    - Path 2: .../delete_user_conversation?conversation_id=X (Delete a specific conversation)
+    - Mandatory in Request Body: lesson_id
+    """
+    try:
+        # 1. Get lesson_id from Request Body
+        lesson_id = request.data.get('lesson_id')
+        
+        # 2. Get conversation_id from Query Parameters (?conversation_id=X)
+        conv_id = request.query_params.get('conversation_id')
+        
+        user = request.user
+
+        # Validation: lesson_id is mandatory in the body
+        if not lesson_id:
+            return Response(
+                {"message": "lesson_id is mandatory in the request body"}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic():
+            now = timezone.now()
+
+            if conv_id:
+                # --- Scenario: Delete each conversation (Single) ---
+                # Check if the record exists within the provided lesson scope
+                user_conv = UserConversation.objects.filter(
+                    user=user, 
+                    conversation_id=conv_id,
+                    conversation__lesson_id=lesson_id
+                ).first()
+
+                if not user_conv:
+                    return Response(
+                        {"message": "No record found for this conversation_id in the specified lesson"}, 
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+                
+                # Delete keywords practice data first
+                UserConversationKeyword.objects.filter(user=user, conversation_id=conv_id).delete()
+                
+                # Delete the main conversation progress
+                user_conv.delete()
+
+                # Recalculate lesson overall progress
+                update_lesson_progress(user, lesson_id)
+                message = f"Conversation {conv_id} in lesson {lesson_id} deleted successfully."
+
+            else:
+                # --- Scenario: Delete all conversations (Bulk) ---
+                # Fetch all question IDs belonging to this lesson
+                all_conv_ids = ConversationElearning.objects.filter(
+                    lesson_id=lesson_id, 
+                    type=ConversationElearning.MessageType.QUESTION
+                ).values_list('id', flat=True)
+
+                if not all_conv_ids.exists():
+                    return Response({"message": "Lesson not found or has no questions"}, status=404)
+
+                # Wipe all keyword and conversation records for this lesson
+                UserConversationKeyword.objects.filter(user=user, conversation_id__in=all_conv_ids).delete()
+                UserConversation.objects.filter(user=user, conversation_id__in=all_conv_ids).delete()
+
+                # Reset the lesson summary in UserLessons
+                UserLessons.objects.filter(user=user, lesson_id=lesson_id).update(
+                    progress=0.00,
+                    status=UserLessons.lesson_status.START,
+                    completed_signs=0,
+                    updated_date=now,
+                    update_by=user
+                )
+                message = f"All progress for lesson {lesson_id} has been reset."
+
+            return Response({
+                "status": 200, 
+                "message": message
+            }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({"message": f"Server Error: {str(e)}"}, status=500)
+
+def update_lesson_progress(user, lesson_id):
+    """
+    Helper function to recalculate UserLessons progress after a single conversation is deleted.
+    """
+    from django.db.models import Sum, Count, Q
+    
+    # Get total questions in the lesson as the denominator
+    lesson_questions = ConversationElearning.objects.filter(
+        lesson_id=lesson_id, 
+        type=ConversationElearning.MessageType.QUESTION
+    )
+    total_q = lesson_questions.count()
+    all_ids = lesson_questions.values_list('id', flat=True)
+
+    if total_q > 0:
+        # Calculate new progress sum
+        sum_p = UserConversation.objects.filter(user=user, conversation_id__in=all_ids).aggregate(s=Sum('progress'))['s'] or 0.0
+        new_progress = float(sum_p) / total_q
+        
+        # Count questions that reached 'success' status
+        completed = UserConversation.objects.filter(user=user, conversation_id__in=all_ids, status='success').count()
+
+        # Sync changes to UserLessons table
+        UserLessons.objects.update_or_create(
+            user=user, lesson_id=lesson_id,
+            defaults={
+                'progress': round(new_progress, 2),
+                'completed_signs': completed,
+                'status': 'inprogress' if 0 < new_progress < 0.95 else ('completed' if new_progress >= 0.95 else 'start'),
+                'updated_date': timezone.now()
+            }
+        )
+    # endregion
